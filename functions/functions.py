@@ -2,7 +2,6 @@
 import numpy as np
 import cv2
 import os
-import argparse
 from scipy.io import savemat
 import matplotlib.pyplot as plt
 import casadi as ca
@@ -68,17 +67,14 @@ def ComputeCorners(base_path, pattern_size, image_files):
         ret, corners = cv2.findChessboardCorners(gray, pattern_size, None)
 
         if ret:
-            # Refine corner locations (optional, but recommended)
-            # criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-            # corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-
             drawn_image = I.copy()
             cv2.drawChessboardCorners(drawn_image, pattern_size, corners, ret)
 
-            image_points = corners.reshape(-1, 2).T  # shape becomes (2, num_points)
+            image_points = corners.reshape(-1, 2).T
             u_points = image_points[0, :]
             v_points = image_points[1, :]
 
+            # Order the points of the cheesboard in oder to have points as the ones I defined in the model points
             u_points = u_points.reshape((ny, nx))
             v_points = v_points.reshape((ny, nx))
             u_points = u_points[:, ::-1]
@@ -86,8 +82,11 @@ def ComputeCorners(base_path, pattern_size, image_files):
             u_points = u_points.reshape((1, nx * ny))
             v_points = v_points.reshape((1, nx * ny))
 
+            # Save points Image Plane
             data_uv[0, :, k] = u_points
             data_uv[1, :, k] = v_points
+
+            # Save points model plane
             data_xy[0:2, :, k] = points2D[0:2, :]
         else:
             print(f"Checkerboard not detected in image: {full_file_name}")
@@ -104,7 +103,7 @@ def Normalization(X):
     x_mean = np.mean(X[0, :])
     y_mean = np.mean(X[1, :])
 
-    # Compute the sample variances for x and y (using ddof=1 to mimic MATLAB's var behavior)
+    # Compute the sample variances for x and y
     x_var = np.var(X[0, :], ddof=1)
     y_var = np.var(X[1, :], ddof=1)
 
@@ -119,23 +118,31 @@ def Normalization(X):
 
 
 def EstimatePose(H, A):
+    # Create empty variables for the rotation matrices
     R = np.zeros((3, 3, H.shape[2]))
+
+    # Translation vectors
     t = np.zeros((3, H.shape[2]))
     A_inv = np.linalg.pinv(A)
 
     for k in range(H.shape[2]):
+        # Split columns of the Homography matrix
         h_0 = H[:, 0, k]
         h_1 = H[:, 1, k]
         h_2 = H[:, 2, k]
+
+        # Compute scaling factor
         lambda_aux = 1 / np.linalg.norm(A_inv @ h_0)
+
+        # Compute rotation matrix
         r_0 = lambda_aux * (A_inv @ h_0)
         r_1 = lambda_aux * (A_inv @ h_1)
         r_2 = np.cross(r_0, r_1)
 
-        # Form the rotation matrix by stacking the basis vectors as columns
+        # Create rotation matrix by stacking the columns computed before
         R_aux = np.column_stack((r_0, r_1, r_2))
 
-        # Perform the SVD of R and recompose to ensure orthogonality
+        # Refining the rotation matrix to guarantee orthogonality
         U_r, _, Vh_r = np.linalg.svd(R_aux)
         R[:, :, k] = U_r @ Vh_r  # Note: Vh_r is V transposed
 
@@ -146,15 +153,16 @@ def EstimatePose(H, A):
 
 
 def HomographyAnalytical(X, U):
-    # Normalize the data. Since our normalization function expects 2 x n arrays,
-    # we pass only the first two rows (x and y coordinates).
+
+    # Normalization of the matrices
     H_X = Normalization(X[0:2, :])
     H_U = Normalization(U[0:2, :])
 
-    # Transform the points into normalized coordinates.
+    # Transform the points into normalized coordinates
     X_norm = H_X @ X
     U_norm = H_U @ U
 
+    # Empty matrix
     A = []
     n_points = U_norm.shape[1]
     for k in range(n_points):
@@ -172,11 +180,14 @@ def HomographyAnalytical(X, U):
 
     A = np.array(A)
 
+    # Compute SVD to solve Ax = 0
     _, _, Vh = np.linalg.svd(A)
     h_nomr = Vh[-1, :]
 
+    # A solution that minimizes the norm
     H_norm = h_nomr.reshape((3, 3))
 
+    # Inverse normalization to obtain the original homography matrix
     H = np.linalg.pinv(H_U) @ H_norm @ H_X
     return H
 
@@ -185,50 +196,64 @@ def EstimateHomographyCasadi(pts1, pts2, H_init):
     pts1 = np.asarray(pts1, dtype=np.float64)
     pts2 = np.asarray(pts2, dtype=np.float64)
 
+    # Number of poinst of the model plane
     N = pts1.shape[0]
+
+    # check for the same number of points in the image plane
     if pts2.shape[0] != N:
         raise ValueError("pts1 and pts2 must have the same number of points.")
 
+    # Create symbolic variables
     H_sym = ca.SX.sym("H_sym", 9)
     H_mat = ca.reshape(H_sym, 3, 3)
+
+    # Reshape the symbolic optimization variables in order to have a matrix
+
+    # Init cost value
     cost = 0
+
+    # Cost over the different views(Images)
     for i in range(N):
+        # Extracting points of the model
         x1 = pts1[i, 0]
         y1 = pts1[i, 1]
+        # Extracting points of the  image plane
         x2 = pts2[i, 0]
         y2 = pts2[i, 1]
 
+        # Computing projectin over the image plane
         denom = H_mat[2, 0] * x1 + H_mat[2, 1] * y1 + H_mat[2, 2]
         x2_est = (H_mat[0, 0] * x1 + H_mat[0, 1] * y1 + H_mat[0, 2]) / denom
         y2_est = (H_mat[1, 0] * x1 + H_mat[1, 1] * y1 + H_mat[1, 2]) / denom
 
+        # Compute cost
         cost = cost + (x2 - x2_est) ** 2 + (y2 - y2_est) ** 2
 
-    # Define the NLP problem
+    # Define the NLP problem for casadi
     nlp = {"x": H_sym, "f": cost}
 
     opts = {"print_time": 0, "ipopt": {"print_level": 0}}
-
     solver = ca.nlpsol("solver", "ipopt", nlp, opts)
 
+    # Defines the init Homography for the problem
     H_init_vec = np.array(H_init, dtype=np.float64)
-
     x0 = H_init_vec.flatten(order="F")
 
+    # Solves the problem
     sol = solver(x0=x0)
-
     H_opt_vec = np.array(sol["x"]).flatten()  # 9-element vector
+
+    # Normalize the solution
     H_opt = H_opt_vec.reshape((3, 3), order="F")
     H_opt = H_opt / H_opt[2, 2]
-
     return H_opt
 
 
 def EstimateHomography(X, U):
+    # Create empty matrix to store the homography matrices
     H = np.zeros((3, 3, X.shape[2]))
     H_casadi = np.zeros((3, 3, X.shape[2]))
     for k in range(0, X.shape[2]):
-
         # Solve initial Homogrpahy
         H[:, :, k] = HomographyAnalytical(X[:, :, k], U[:, :, k])
 
@@ -301,11 +326,7 @@ def EstimateBMatrix(H):
             L = None  # or handle the indefinite case as needed
 
     if L is not None:
-        # MATLAB: A_t = L(3,3) * (inv(L))';
-        # In Python, using 0-indexing: L[2,2] * (np.linalg.inv(L)).T
         A = L[2, 2] * np.linalg.inv(L).T
-
-        # Compute the pseudo-inverse of A.
         A_inv = np.linalg.pinv(A)
     return A
 
@@ -348,14 +369,304 @@ def EstimateDistortion(X, U, R_estimation, t_estimation, A):
         aux = np.hstack([aux_radius_square_reshape, aux_radius_square_square_reshape])
         D_list.append(aux)
 
-        # Compute the error between the real and estimated points.
         error = U_real - U_estimated
         error_reshape = error.reshape((2 * error.shape[1], 1))
         b_list.append(error_reshape)
 
-    # After processing all samples, stack the collected arrays vertically.
     D = np.vstack(D_list)
     b = np.vstack(b_list)
-    distortion = np.linalg.pinv(D) @ b
 
+    # Solution for the distortion parameters
+    distortion = np.linalg.pinv(D) @ b
     return distortion
+
+
+def cameraCalibrationCostFunction(n, points, samples):
+    # Dimensions
+    n_rows = n
+    n_cols = points
+    N = samples
+
+    # Number of data points total
+    n_pts_total = n_cols * N
+
+    # Numebr of optimization variables hard code values
+    n_params = 7 + 6 * N
+
+    # Define symbolic variables (where we have the parameters to optimize and the inputs such as points in the model plane and image plane)
+    a_vector = ca.SX.sym("full_estimation", n_params, 1)
+    pts1_sym = ca.SX.sym("pts1", n_rows, n_pts_total)
+    pts2_sym = ca.SX.sym("pts2", n_rows, n_pts_total)
+
+    # Intrinsic parameters
+    A = ca.vertcat(
+        ca.horzcat(a_vector[0], a_vector[1], a_vector[3]),
+        ca.horzcat(0, a_vector[2], a_vector[4]),
+        ca.horzcat(0, 0, 1),
+    )
+
+    F_identity = ca.DM.eye(3)
+    Identity = ca.DM([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])
+    const_transform = F_identity @ Identity
+
+    # Precompute
+    zeros_row = ca.DM.zeros(1, n_cols)
+    ones_row = ca.DM.ones(1, n_cols)
+    aux_last_element_homogeneous = ca.DM([[0, 0, 0, 1]])
+
+    # Optimization variables related to the orientation and position
+    vector_optimization = a_vector[7:]
+    x_vector = ca.reshape(vector_optimization, 6, N)
+    x = x_vector[0:3, :]  # quaternions in a vector space
+    trans = x_vector[3:6, :]  # translations
+
+    error_blocks = []
+    for k in range(N):
+        # Determine the column slice for the k-th sample (data stored as 2 x (points*N)).
+        start_index = k * n_cols
+        end_index = (k + 1) * n_cols
+
+        # Getting the values of the model plane and the image plane
+        pts1_slice = pts1_sym[:, start_index:end_index]  # shape: (n_rows x n_cols)
+        pts2_slice = pts2_sym[:, start_index:end_index]  # shape: (n_rows x n_cols)
+        U_real = pts2_slice
+
+        # Mapping the Euclidean space to quaternions
+        xk = x[:, k]  # 3x1 vector
+        norm_sq = ca.dot(xk, xk)
+        denom = 1 + norm_sq
+        q0 = (1 - norm_sq) / denom
+        q1 = 2 * xk[0] / denom
+        q2 = 2 * xk[1] / denom
+        q3 = 2 * xk[2] / denom
+        quaternion = ca.vertcat(q0, q1, q2, q3)
+
+        trans_aux = trans[:, k]
+
+        # Computing the rotation matrix and translation
+        R_est = quat_to_rot(quaternion)
+        T_estimated = ca.vertcat(
+            ca.horzcat(R_est, trans_aux), aux_last_element_homogeneous
+        )
+
+        # Create homogeneous coordinates for pts1_slice
+        homogeneous_pts = ca.vertcat(pts1_slice, zeros_row, ones_row)
+        values_normalized = const_transform @ T_estimated @ homogeneous_pts
+        aux_normalization = ca.vertcat(values_normalized[2, :], values_normalized[2, :])
+
+        # Normalized values
+        values_normalized_aux = values_normalized[0:2, :] / aux_normalization
+
+        # Computing Radial Distortion
+        radius = ca.sqrt(ca.sum1(values_normalized_aux**2))
+        D_expr = 1 + a_vector[5] * (radius**2) + a_vector[6] * (radius**4)
+        D_aux = ca.vertcat(D_expr, D_expr)
+        x_warp = values_normalized_aux * D_aux
+
+        # Create homogeneous coordinates for the warped points
+        x_warp_aux = ca.vertcat(x_warp, ones_row)
+        U_improved = A @ x_warp_aux
+        U_normalized_aux = ca.vertcat(U_improved[2, :], U_improved[2, :])
+        U_improved_final = U_improved[0:2, :] / U_normalized_aux
+
+        # Compute error M view
+        error = U_real - U_improved_final  # shape: (n_rows x n_cols)
+        error_vec = ca.reshape(error, n_rows * n_cols, 1)
+        error_blocks.append(error_vec)
+
+    # everthing in a vector
+    all_errors = ca.vertcat(*error_blocks)
+    total_cost = ca.dot(all_errors, all_errors)
+
+    # Create the CasADi function.
+    f_cost = ca.Function(
+        "f_cost",
+        [a_vector, pts1_sym, pts2_sym],
+        [total_cost],
+        ["a_vector", "pts1", "pts2"],
+        ["cost"],
+    )
+    return f_cost
+
+
+def quat_to_rot(q):
+    q0 = q[0]
+    q1 = q[1]
+    q2 = q[2]
+    q3 = q[3]
+    R = ca.vertcat(
+        ca.horzcat(
+            1 - 2 * (q2**2 + q3**2), 2 * (q1 * q2 - q0 * q3), 2 * (q1 * q3 + q0 * q2)
+        ),
+        ca.horzcat(
+            2 * (q1 * q2 + q0 * q3), 1 - 2 * (q1**2 + q3**2), 2 * (q2 * q3 - q0 * q1)
+        ),
+        ca.horzcat(
+            2 * (q1 * q3 - q0 * q2), 2 * (q2 * q3 + q0 * q1), 1 - 2 * (q1**2 + q2**2)
+        ),
+    )
+    return R
+
+
+def cameraCalibrationCasADi(pts1, pts2, f_casadi):
+
+    pts1 = np.array(pts1, dtype=float)
+    pts2 = np.array(pts2, dtype=float)
+
+    # Number of views
+    N = pts1.shape[2]
+
+    n_params = 7 + 6 * N
+    a_vector = ca.SX.sym("full_estimation", n_params, 1)
+    # Reshape elements model plane so we have the data in a huge matrix
+    pts1_dm = pts1[:, :, 0]
+    for i in range(1, pts1.shape[2]):
+        pts1_dm = np.hstack((pts1_dm, pts1[:, :, i]))
+
+    # Reshape elements image plane so we have the data in a huge matrix
+    pts2_dm = pts2[:, :, 0]
+    for i in range(1, pts2.shape[2]):
+        pts2_dm = np.hstack((pts2_dm, pts2[:, :, i]))
+
+    # Compute cost directly from my function
+    result = f_casadi(a_vector, pts1_dm, pts2_dm)
+    cost = result
+    nlp = {"x": a_vector, "f": cost}
+
+    H_cost = ca.hessian(cost, a_vector)[0]
+
+    # Get the sparsity pattern.
+    H_sparsity = H_cost.sparsity()
+
+    # Visualize the sparsity pattern.
+    plt.figure(figsize=(6, 6))
+    plt.spy(H_sparsity, markersize=3)
+    plt.title("Sparsity Pattern of the Calibration Cost Hessian")
+    plt.xlabel("Opt Variables")
+    plt.ylabel("Opt Variables")
+    # plt.show()
+
+    # IPOPT options.
+    opts = {"print_time": True, "ipopt": {"print_level": 5}}
+    solver = ca.nlpsol("solver", "ipopt", nlp, opts)
+    return solver
+
+
+def SetInitialConditions(R_estimation, t_estimation, A, d):
+    # Reshape my rotation matrix in order to have matrices compatible with the library
+    R_matrices = np.transpose(R_estimation, (2, 0, 1))
+    rotations = Rotation.from_matrix(R_matrices)
+    quat_scipy = rotations.as_quat()  # shape: (n_samples, 4)
+
+    # Quaternions are in the following form w, x, y, z
+    quaternion_estimated = np.column_stack(
+        (quat_scipy[:, 3], quat_scipy[:, 0], quat_scipy[:, 1], quat_scipy[:, 2])
+    )
+
+    # Initial solution from the intrinsic parameters
+    X_init_list = [A[0, 0], A[0, 1], A[1, 1], A[0, 2], A[1, 2], d[0], d[1]]
+
+    # Loop through each sample
+    for k in range(R_estimation.shape[2]):
+        x_quaternion = quaternion_estimated[k, 1:] / quaternion_estimated[k, 0]
+        X_init_list.extend(x_quaternion.tolist() + t_estimation[:, k].tolist())
+
+    X_init = np.array(X_init_list)
+    return X_init
+
+
+def cameraCalibrationOpti(n, points, samples, pts1_dm, pts2_dm):
+    n_rows = n  # e.g., 2
+    n_cols = points  # e.g., 54
+    N = samples  # e.g., 13
+    n_pts_total = n_cols * N  # e.g., 702
+    n_params = 7 + 6 * N  # global (7) + per-sample (6 each)
+
+    opti = ca.Opti()
+
+    # Define the optimization variable
+    a_vector = opti.variable(n_params, 1)
+    dummy = opti.variable()
+
+    # Define constant parameters (they are fixed and known)
+    pts1 = opti.parameter(n_rows, n_pts_total)
+    pts2 = opti.parameter(n_rows, n_pts_total)
+    opti.set_value(pts1, pts1_dm)
+    opti.set_value(pts2, pts2_dm)
+
+    # Define the intrinsic matrix A (global parameters in a_vector[0:5]).
+    A = ca.vertcat(
+        ca.horzcat(a_vector[0], a_vector[1], a_vector[3]),
+        ca.horzcat(0, a_vector[2], a_vector[4]),
+        ca.horzcat(0, 0, 1),
+    )
+
+    # Precompute constant matrices.
+    F_identity = ca.DM.eye(3)
+    Identity = ca.DM([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])
+    const_transform = F_identity @ Identity
+
+    zeros_row = ca.DM.zeros(1, n_cols)
+    ones_row = ca.DM.ones(1, n_cols)
+
+    # The remaining parameters (starting at index 7) are per-sample.
+    vector_optimization = a_vector[7:]
+    x_vector = ca.reshape(vector_optimization, 6, N)
+    x = x_vector[0:3, :]  # shape: 3 x N (for rotation)
+    trans = x_vector[3:6, :]  # shape: 3 x N (for translation)
+
+    # Build the cost as a sum of squared errors from each sample.
+    error_blocks = []
+    for k in range(N):
+        start_index = k * n_cols
+        end_index = (k + 1) * n_cols
+
+        pts1_slice = pts1[:, start_index:end_index]
+        pts2_slice = pts2[:, start_index:end_index]
+
+        # Compute quaternion from 3 parameters (for sample k).
+        xk = x[:, k]
+        norm_sq = ca.dot(xk, xk)
+        denom = 1 + norm_sq
+        q0 = (1 - norm_sq) / denom
+        q1 = 2 * xk[0] / denom
+        q2 = 2 * xk[1] / denom
+        q3 = 2 * xk[2] / denom
+        quaternion = ca.vertcat(q0, q1, q2, q3)
+
+        # Transformation.
+        trans_aux = trans[:, k]
+        R_est = quat_to_rot(quaternion)
+        T_estimated = ca.vertcat(ca.horzcat(R_est, trans_aux), ca.DM([[0, 0, 0, 1]]))
+
+        # Warp pts1.
+        homogeneous_pts = ca.vertcat(pts1_slice, zeros_row, ones_row)
+        values_normalized = const_transform @ T_estimated @ homogeneous_pts
+        aux_normalization = ca.vertcat(values_normalized[2, :], values_normalized[2, :])
+        values_normalized_aux = values_normalized[0:2, :] / aux_normalization
+
+        # Apply distortion.
+        radius = ca.sqrt(ca.sum1(values_normalized_aux**2))
+        D_expr = 1 + a_vector[5] * (radius**2) + a_vector[6] * (radius**4)
+        D_aux = ca.vertcat(D_expr, D_expr)
+        x_warp = values_normalized_aux * D_aux
+
+        x_warp_aux = ca.vertcat(x_warp, ca.DM.ones(1, n_cols))
+        U_improved = A @ x_warp_aux
+        U_normalized_aux = ca.vertcat(U_improved[2, :], U_improved[2, :])
+        U_improved_final = U_improved[0:2, :] / U_normalized_aux
+
+        error = pts2_slice - U_improved_final
+        error_vec = ca.reshape(error, n_rows * n_cols, 1)
+        error_blocks.append(error_vec)
+
+    # Stack error blocks and define the total cost.
+    all_errors = ca.vertcat(*error_blocks)
+    total_cost = ca.dot(all_errors, all_errors)
+    opti.minimize(total_cost)
+    opti.subject_to(dummy == 0)
+
+    # Set IPOPT options.
+    opti.solver("ipopt", {"expand": True})
+
+    return opti, a_vector
